@@ -1,261 +1,107 @@
-# Qwen Code API Reference
+# Qwen OAuth API Reference
 
-Qwen Code uses an **OpenAI-compatible Chat Completions API** as its core interface. All model providers — including DashScope (Alibaba Cloud), OpenAI, DeepSeek, OpenRouter, and ModelScope — are accessed through the standard `/v1/chat/completions` endpoint using the [OpenAI Node.js SDK](https://www.npmjs.com/package/openai).
-
-In short: **yes, it is OpenAI-compatible**. If you can host an OpenAI-compatible server, Qwen Code can talk to it. The sections below document the exact endpoints, request/response formats, provider-specific headers, and the Qwen OAuth flow.
+This document covers the API used by Qwen Code when running with the **qwen-oauth** auth type — the default, free authentication method that requires only a `qwen.ai` account.
 
 ---
 
 ## Table of Contents
 
-- [Chat Completions](#chat-completions)
+- [How Authentication Works](#how-authentication-works)
+  - [Overview](#overview)
+  - [Step 1: Generate a Device Code](#step-1-generate-a-device-code)
+  - [Step 2: Confirm the Device Code](#step-2-confirm-the-device-code)
+  - [Step 3: Token Refresh](#step-3-token-refresh)
+- [How Messages Are Sent](#how-messages-are-sent)
   - [Endpoint](#endpoint)
-  - [Request Format](#request-format)
-  - [Response Format](#response-format)
-  - [Streaming](#streaming)
+  - [Request Headers](#request-headers)
+  - [Request Body](#request-body)
+- [How Messages Are Received](#how-messages-are-received)
+  - [Non-Streaming Response](#non-streaming-response)
+  - [Streaming Response](#streaming-response)
+  - [Streaming Errors](#streaming-errors)
+- [Available Models](#available-models)
+- [Features](#features)
+  - [Vision (Image Understanding)](#vision-image-understanding)
+  - [Web Search](#web-search)
   - [Tool / Function Calling](#tool--function-calling)
-- [Supported Providers & Base URLs](#supported-providers--base-urls)
-- [Authentication](#authentication)
-  - [API Key (Bearer Token)](#api-key-bearer-token)
-  - [Qwen OAuth 2.0 Device Flow](#qwen-oauth-20-device-flow)
-- [Provider-Specific Headers](#provider-specific-headers)
-- [DashScope Web Search API](#dashscope-web-search-api)
-- [Configuration Reference](#configuration-reference)
-- [Differences from Vanilla OpenAI](#differences-from-vanilla-openai)
+  - [Prompt Caching](#prompt-caching)
 
 ---
 
-## Chat Completions
+## How Authentication Works
 
-### Endpoint
+### Overview
 
-```
-POST {baseUrl}/chat/completions
-```
+Qwen OAuth uses the **OAuth 2.0 Device Authorization Grant** ([RFC 8628](https://datatracker.ietf.org/doc/html/rfc8628)) with **PKCE** ([RFC 7636](https://datatracker.ietf.org/doc/html/rfc7636)). The flow is:
 
-All providers use the OpenAI Chat Completions endpoint. The `baseUrl` already includes `/v1` (or equivalent), so the full path is:
+1. Client generates a PKCE pair (`code_verifier` + `code_challenge`).
+2. Client requests a **device code** from `chat.qwen.ai`.
+3. User opens a browser link and authorizes.
+4. Client polls for an **access token**.
+5. Access token is used as a `Bearer` token for all DashScope API calls.
+6. When the token expires, the client uses the **refresh token** to get a new one.
 
-| Provider     | Full URL                                                              |
-| ------------ | --------------------------------------------------------------------- |
-| DashScope CN | `https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions`  |
-| DashScope Intl | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions` |
-| OpenAI       | `https://api.openai.com/v1/chat/completions`                         |
-| DeepSeek     | `https://api.deepseek.com/v1/chat/completions`                       |
-| OpenRouter   | `https://openrouter.ai/api/v1/chat/completions`                      |
-| ModelScope   | `https://api.modelscope.cn/v1/chat/completions`                      |
+**OAuth constants used by Qwen Code:**
 
-### Request Format
+| Constant | Value |
+| -------- | ----- |
+| OAuth base URL | `https://chat.qwen.ai` |
+| Client ID | `f0304373b74a44d2b584a3fb70ca9e56` |
+| Scope | `openid profile email model.completion` |
+| Device code grant type | `urn:ietf:params:oauth:grant-type:device_code` |
 
-Standard OpenAI Chat Completions request body:
+### Step 1: Generate a Device Code
 
-```jsonc
-{
-  "model": "qwen3-coder-plus",          // Model identifier
-  "messages": [                          // Conversation history
-    {
-      "role": "system",
-      "content": "You are a helpful assistant."
-    },
-    {
-      "role": "user",
-      "content": "Hello"                 // Can also be an array of content parts for vision
-    },
-    {
-      "role": "assistant",
-      "content": "Hi there!"
-    },
-    {
-      "role": "tool",                    // Tool result message
-      "tool_call_id": "call_abc123",
-      "content": "{ \"result\": 42 }"
-    }
-  ],
+Before requesting a device code, the client generates a **PKCE pair**:
 
-  // Optional sampling parameters
-  "temperature": 0.7,
-  "top_p": 0.9,
-  "top_k": 40,                          // Supported by DashScope/Qwen models
-  "max_tokens": 4096,
-  "presence_penalty": 0.0,
-  "frequency_penalty": 0.0,
-  "repetition_penalty": 1.0,            // DashScope extension
+- **`code_verifier`**: 32 random bytes, base64url-encoded.
+- **`code_challenge`**: SHA-256 hash of the `code_verifier`, base64url-encoded.
 
-  // Streaming
-  "stream": true,
-  "stream_options": { "include_usage": true },
+The client stores the `code_verifier` locally (never sent to the server until token exchange).
 
-  // Tool / function calling
-  "tools": [
-    {
-      "type": "function",
-      "function": {
-        "name": "get_weather",
-        "description": "Get weather for a location",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "location": { "type": "string" }
-          },
-          "required": ["location"]
-        }
-      }
-    }
-  ],
-  "tool_choice": "auto"                 // "auto" | "required" | {"type":"function","function":{"name":"..."}}
-}
-```
-
-### Response Format
-
-Standard OpenAI Chat Completions response:
-
-```jsonc
-{
-  "id": "chatcmpl-abc123",
-  "object": "chat.completion",
-  "created": 1700000000,
-  "model": "qwen3-coder-plus",
-  "choices": [
-    {
-      "index": 0,
-      "message": {
-        "role": "assistant",
-        "content": "Hello! How can I help you?",
-        "tool_calls": [                  // Present when the model invokes tools
-          {
-            "id": "call_abc123",
-            "type": "function",
-            "function": {
-              "name": "get_weather",
-              "arguments": "{\"location\":\"Beijing\"}"
-            }
-          }
-        ]
-      },
-      "finish_reason": "stop"            // "stop" | "tool_calls" | "length"
-    }
-  ],
-  "usage": {
-    "prompt_tokens": 50,
-    "completion_tokens": 20,
-    "total_tokens": 70,
-    "prompt_tokens_details": {
-      "cached_tokens": 30               // DashScope prompt caching
-    }
-  }
-}
-```
-
-> **Note:** DashScope may also return `cached_tokens` at the top level of `usage` (alongside `prompt_tokens_details`). Qwen Code normalizes both formats.
-
-### Streaming
-
-When `"stream": true`, the response is delivered as Server-Sent Events (SSE). Each chunk follows the OpenAI streaming format:
-
-```
-data: {"id":"chatcmpl-abc","object":"chat.completion.chunk","created":1700000000,"model":"qwen3-coder-plus","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}
-
-data: {"id":"chatcmpl-abc","object":"chat.completion.chunk","created":1700000000,"model":"qwen3-coder-plus","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":50,"completion_tokens":20,"total_tokens":70}}
-
-data: [DONE]
-```
-
-**DashScope-specific streaming behavior:**
-- Some providers may return errors embedded in the stream as a chunk with `"finish_reason": "error_finish"` and the error message in `delta.content`, rather than an HTTP error status code.
-
-### Tool / Function Calling
-
-Tools are defined in the standard OpenAI format. During streaming, tool call arguments arrive incrementally:
-
-```jsonc
-// Streaming chunk with tool call fragment
-{
-  "choices": [{
-    "delta": {
-      "tool_calls": [{
-        "index": 0,
-        "id": "call_abc123",           // Present in first chunk for this tool call
-        "function": {
-          "name": "get_weather",       // Present in first chunk
-          "arguments": "{\"loc"        // Partial JSON, accumulated across chunks
-        }
-      }]
-    }
-  }]
-}
-```
-
-Qwen Code accumulates these fragments and reconstructs the complete tool call when `finish_reason` is received.
-
----
-
-## Supported Providers & Base URLs
-
-Provider detection is automatic based on the configured `baseUrl`:
-
-| Provider       | Base URL                                                         | Detection Rule                                |
-| -------------- | ---------------------------------------------------------------- | --------------------------------------------- |
-| **DashScope**  | `https://dashscope.aliyuncs.com/compatible-mode/v1` (default)    | URL contains `dashscope.aliyuncs.com`, or `authType` is `qwen-oauth`, or no `baseUrl` set |
-| **DashScope Intl** | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`    | URL contains `dashscope-intl.aliyuncs.com`    |
-| **Coding Plan CN** | `https://coding.dashscope.aliyuncs.com/v1`                  | URL contains `dashscope.aliyuncs.com`         |
-| **Coding Plan Intl** | `https://coding-intl.dashscope.aliyuncs.com/v1`           | URL contains `dashscope.aliyuncs.com`         |
-| **OpenAI**     | `https://api.openai.com/v1`                                      | Fallback (default provider)                   |
-| **DeepSeek**   | `https://api.deepseek.com/v1`                                    | URL contains `api.deepseek.com`               |
-| **OpenRouter** | `https://openrouter.ai/api/v1`                                   | URL contains `openrouter.ai`                  |
-| **ModelScope** | `https://api.modelscope.cn/v1`                                   | URL contains `modelscope.cn`                  |
-
-Any URL that doesn't match a specific provider falls through to the **Default** (generic OpenAI-compatible) provider.
-
----
-
-## Authentication
-
-### API Key (Bearer Token)
-
-All OpenAI-compatible providers use standard Bearer token authentication, injected automatically by the OpenAI SDK:
-
-```
-Authorization: Bearer <apiKey>
-```
-
-The API key is resolved from (highest to lowest priority):
-1. CLI flags (`--openai-api-key`)
-2. System environment variables (`OPENAI_API_KEY`, `DASHSCOPE_API_KEY`, etc.)
-3. `.env` file
-4. `settings.json` → `env` field
-
-### Qwen OAuth 2.0 Device Flow
-
-For the default Qwen experience (no API key needed), Qwen Code implements [RFC 8628 (OAuth 2.0 Device Authorization Grant)](https://datatracker.ietf.org/doc/html/rfc8628):
-
-**Step 1 — Request device code:**
+Then the client sends:
 
 ```
 POST https://chat.qwen.ai/api/v1/oauth2/device/code
 Content-Type: application/x-www-form-urlencoded
 Accept: application/json
+x-request-id: <random UUID>
 ```
+
+**Request body** (form-encoded):
 
 ```
 client_id=f0304373b74a44d2b584a3fb70ca9e56
 &scope=openid+profile+email+model.completion
-&code_challenge=<S256_CHALLENGE>
+&code_challenge=<BASE64URL_SHA256_HASH>
 &code_challenge_method=S256
 ```
 
-**Response:**
-```jsonc
+**Response** (success):
+
+```json
 {
-  "device_code": "...",
+  "device_code": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
   "user_code": "ABCD-1234",
   "verification_uri": "https://chat.qwen.ai/device",
   "verification_uri_complete": "https://chat.qwen.ai/device?user_code=ABCD-1234",
-  "expires_in": 600,
-  "interval": 5
+  "expires_in": 600
 }
 ```
 
-**Step 2 — User authorizes in browser**, then the client polls for a token:
+| Field | Description |
+| ----- | ----------- |
+| `device_code` | Opaque code used to poll for the token |
+| `user_code` | Short code the user enters or sees on the authorization page |
+| `verification_uri` | URL the user opens in their browser |
+| `verification_uri_complete` | Full URL with the `user_code` pre-filled |
+| `expires_in` | Seconds before the device code expires (typically 600) |
+
+Qwen Code automatically opens `verification_uri_complete` in the user's browser (or displays it in the terminal for headless environments).
+
+### Step 2: Confirm the Device Code
+
+After the user authorizes in their browser, the client polls for a token. Polling starts at a 2-second interval and the client makes up to `expires_in / interval` attempts.
 
 ```
 POST https://chat.qwen.ai/api/v1/oauth2/token
@@ -263,32 +109,53 @@ Content-Type: application/x-www-form-urlencoded
 Accept: application/json
 ```
 
+**Request body** (form-encoded):
+
 ```
 grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code
 &client_id=f0304373b74a44d2b584a3fb70ca9e56
 &device_code=<DEVICE_CODE>
-&code_verifier=<PKCE_VERIFIER>
+&code_verifier=<PKCE_CODE_VERIFIER>
 ```
 
-**Response (success):**
-```jsonc
+**While waiting for the user:**
+
+- HTTP 400 with `"error": "authorization_pending"` — the user hasn't authorized yet, keep polling.
+- HTTP 429 with `"error": "slow_down"` — polling too fast, the client increases the interval.
+
+**Response** (success — user authorized):
+
+```json
 {
   "access_token": "eyJ...",
   "refresh_token": "...",
-  "id_token": "eyJ...",
+  "token_type": "Bearer",
   "expires_in": 3600,
-  "token_type": "Bearer"
+  "resource_url": "https://dashscope.aliyuncs.com"
 }
 ```
 
-**Polling errors:** `authorization_pending` (HTTP 400) and `slow_down` (HTTP 429) per RFC 8628.
+| Field | Description |
+| ----- | ----------- |
+| `access_token` | JWT used as `Bearer` token for all API calls |
+| `refresh_token` | Used to obtain a new access token when the current one expires |
+| `token_type` | Always `"Bearer"` |
+| `expires_in` | Access token lifetime in seconds |
+| `resource_url` | Base URL for the DashScope API and web search service |
 
-**Step 3 — Token refresh:**
+The `access_token` and `refresh_token` are cached locally so the user doesn't need to log in again.
+
+### Step 3: Token Refresh
+
+When the `access_token` expires, the client automatically refreshes it:
 
 ```
 POST https://chat.qwen.ai/api/v1/oauth2/token
 Content-Type: application/x-www-form-urlencoded
+Accept: application/json
 ```
+
+**Request body** (form-encoded):
 
 ```
 grant_type=refresh_token
@@ -296,71 +163,268 @@ grant_type=refresh_token
 &client_id=f0304373b74a44d2b584a3fb70ca9e56
 ```
 
-The obtained `access_token` is then used as the Bearer token for DashScope API calls.
-
----
-
-## Provider-Specific Headers
-
-All providers include a common `User-Agent` header:
-
-```
-User-Agent: QwenCode/<version> (<platform>; <arch>)
-```
-
-### DashScope (Qwen) Headers
-
-```http
-X-DashScope-CacheControl: enable              # Enables prompt caching
-X-DashScope-UserAgent: QwenCode/<version>
-X-DashScope-AuthType: qwen-oauth               # or "openai" for API key auth
-```
-
-### OpenRouter Headers
-
-```http
-HTTP-Referer: https://github.com/QwenLM/qwen-code.git
-X-OpenRouter-Title: Qwen Code
-```
-
-### DeepSeek
-
-No special headers. Note: DeepSeek only supports text content — image/vision parts are stripped from messages.
-
-### ModelScope
-
-No special headers. Note: `stream_options` is removed from non-streaming requests.
-
----
-
-## DashScope Web Search API
-
-Qwen Code also calls a DashScope web search endpoint for the web search tool:
-
-```
-POST {resource_url}/api/v1/indices/plugin/web_search
-Authorization: Bearer <accessToken>
-Content-Type: application/json
-```
+**Response** (success):
 
 ```json
 {
-  "uq": "search query text",
+  "access_token": "eyJ...",
+  "refresh_token": "...",
+  "token_type": "Bearer",
+  "expires_in": 3600,
+  "resource_url": "https://dashscope.aliyuncs.com"
+}
+```
+
+If the refresh token is also expired or invalid (HTTP 400), the credentials are cleared and the user must re-authenticate through the device flow again.
+
+---
+
+## How Messages Are Sent
+
+### Endpoint
+
+Messages are sent using the **OpenAI-compatible Chat Completions API** on DashScope:
+
+```
+POST https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
+```
+
+(or `https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions` for international users.)
+
+The base URL can also come from the `resource_url` returned during OAuth token exchange.
+
+### Request Headers
+
+Every request includes these headers:
+
+```http
+Authorization: Bearer <access_token>
+User-Agent: QwenCode/<version> (<platform>; <arch>)
+X-DashScope-CacheControl: enable
+X-DashScope-UserAgent: QwenCode/<version>
+X-DashScope-AuthType: qwen-oauth
+```
+
+| Header | Purpose |
+| ------ | ------- |
+| `Authorization` | The OAuth access token obtained during login |
+| `X-DashScope-CacheControl` | Enables DashScope prompt caching for repeated content |
+| `X-DashScope-UserAgent` | Identifies the client to DashScope |
+| `X-DashScope-AuthType` | Tells DashScope this is an OAuth-authenticated request (vs. API key) |
+
+### Request Body
+
+The request body follows the standard **OpenAI Chat Completions** format:
+
+```json
+{
+  "model": "coder-model",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a helpful assistant."
+    },
+    {
+      "role": "user",
+      "content": "Explain how quicksort works"
+    }
+  ],
+  "stream": true,
+  "stream_options": { "include_usage": true },
+  "temperature": 0.7,
+  "top_p": 0.9,
+  "max_tokens": 4096
+}
+```
+
+**Message roles:**
+
+| Role | Description |
+| ---- | ----------- |
+| `system` | System prompt that sets the assistant's behavior |
+| `user` | User's message |
+| `assistant` | Previous assistant response (for conversation history) |
+| `tool` | Result of a tool/function call (includes `tool_call_id`) |
+
+**Supported sampling parameters:**
+
+| Parameter | Type | Description |
+| --------- | ---- | ----------- |
+| `temperature` | number | Controls randomness (0.0 = deterministic, higher = more random) |
+| `top_p` | number | Nucleus sampling threshold |
+| `top_k` | number | Top-K sampling |
+| `max_tokens` | number | Maximum number of tokens to generate |
+| `presence_penalty` | number | Penalizes tokens already present in the conversation |
+| `frequency_penalty` | number | Penalizes tokens based on frequency |
+| `repetition_penalty` | number | DashScope-specific repetition penalty |
+
+**Streaming:** When `"stream": true` is set, `"stream_options": { "include_usage": true }` is also added so token usage is included in the final streaming chunk.
+
+---
+
+## How Messages Are Received
+
+### Non-Streaming Response
+
+When `stream` is `false` (or omitted), a single JSON response is returned:
+
+```json
+{
+  "id": "chatcmpl-abc123",
+  "object": "chat.completion",
+  "created": 1700000000,
+  "model": "coder-model",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Quicksort works by selecting a pivot element..."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 50,
+    "completion_tokens": 200,
+    "total_tokens": 250,
+    "prompt_tokens_details": {
+      "cached_tokens": 30
+    }
+  }
+}
+```
+
+| Field | Description |
+| ----- | ----------- |
+| `choices[].message.content` | The assistant's text response |
+| `choices[].message.tool_calls` | Present when the model wants to call a tool (see [Tool / Function Calling](#tool--function-calling)) |
+| `choices[].finish_reason` | Why generation stopped: `"stop"` (natural end), `"tool_calls"` (wants to call tools), `"length"` (hit max_tokens) |
+| `usage.prompt_tokens` | Number of tokens in the prompt |
+| `usage.completion_tokens` | Number of tokens generated |
+| `usage.prompt_tokens_details.cached_tokens` | Number of prompt tokens served from DashScope's cache (saves cost/latency) |
+
+### Streaming Response
+
+When `"stream": true`, the response is delivered as **Server-Sent Events (SSE)**. Each event is a line prefixed with `data: `:
+
+```
+data: {"id":"chatcmpl-abc","object":"chat.completion.chunk","created":1700000000,"model":"coder-model","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-abc","object":"chat.completion.chunk","created":1700000000,"model":"coder-model","choices":[{"index":0,"delta":{"content":"Quick"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-abc","object":"chat.completion.chunk","created":1700000000,"model":"coder-model","choices":[{"index":0,"delta":{"content":"sort"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-abc","object":"chat.completion.chunk","created":1700000000,"model":"coder-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":50,"completion_tokens":200,"total_tokens":250}}
+
+data: [DONE]
+```
+
+The client concatenates all `delta.content` strings to build the full response. Token usage appears on the final chunk (because `include_usage: true` was set).
+
+### Streaming Errors
+
+DashScope may return errors **inside the stream** rather than as HTTP error codes. When a chunk has `"finish_reason": "error_finish"`, the content in `delta.content` is the error message:
+
+```json
+{
+  "choices": [{
+    "index": 0,
+    "delta": { "content": "Rate limit exceeded. Please try again later." },
+    "finish_reason": "error_finish"
+  }]
+}
+```
+
+Qwen Code detects this and raises a `StreamContentError`.
+
+---
+
+## Available Models
+
+The qwen-oauth auth type provides two built-in models:
+
+| Model ID | Description | Vision Support |
+| -------- | ----------- | -------------- |
+| `coder-model` | Qwen 3.5 Plus — efficient hybrid model with leading coding performance | No |
+| `vision-model` | The latest Qwen Vision model from Alibaba Cloud ModelStudio | Yes |
+
+`coder-model` is the default. Switch between models using the `/model` command inside Qwen Code.
+
+**Rate limits** (Qwen OAuth free tier): **60 requests/minute** and **1,000 requests/day**.
+
+---
+
+## Features
+
+### Vision (Image Understanding)
+
+The `vision-model` can understand images. Images are sent as part of the `messages` array using the OpenAI multi-modal content format:
+
+```json
+{
+  "model": "vision-model",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        { "type": "text", "text": "What is in this image?" },
+        {
+          "type": "image_url",
+          "image_url": {
+            "url": "data:image/png;base64,iVBORw0KGgo..."
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+**Supported image formats:**
+
+- **Base64 inline**: `data:<mime>;base64,<data>` (e.g., `data:image/png;base64,...`)
+- **Remote URL**: `https://example.com/image.png`
+
+When using `vision-model`, the DashScope provider also sends `"vl_high_resolution_images": true` in the request body for better OCR and detail extraction.
+
+### Web Search
+
+The web search feature uses a **separate DashScope endpoint** (not the Chat Completions API). The `resource_url` from the OAuth token response provides the base URL.
+
+```
+POST {resource_url}/api/v1/indices/plugin/web_search
+Authorization: Bearer <access_token>
+Content-Type: application/json
+```
+
+**Request:**
+
+```json
+{
+  "uq": "latest TypeScript features",
   "page": 1,
   "rows": 10
 }
 ```
 
+| Field | Description |
+| ----- | ----------- |
+| `uq` | The search query |
+| `page` | Page number (starts at 1) |
+| `rows` | Number of results to return |
+
 **Response:**
-```jsonc
+
+```json
 {
   "data": {
     "docs": [
       {
-        "title": "Page Title",
-        "url": "https://example.com",
-        "snippet": "Relevant text excerpt...",
-        "timestamp_format": "2025-01-15",
+        "title": "TypeScript 5.0 Release Notes",
+        "url": "https://devblogs.microsoft.com/typescript/...",
+        "snippet": "TypeScript 5.0 introduces decorators, const type parameters...",
+        "timestamp_format": "2025-03-01",
         "_score": 0.95
       }
     ]
@@ -368,66 +432,99 @@ Content-Type: application/json
 }
 ```
 
----
+Web search results are fed back into the conversation as context for the model.
 
-## Configuration Reference
+### Tool / Function Calling
 
-The content generator is configured via `settings.json` or CLI arguments. Key fields:
+Qwen models support OpenAI-compatible function calling. Tools are declared in the request:
 
-```jsonc
+```json
 {
-  "model": "qwen3-coder-plus",        // Model ID sent to the API
-  "apiKey": "sk-...",                  // API key (or use envKey for env var reference)
-  "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-  "authType": "openai",               // "openai" | "qwen-oauth" | "anthropic" | "gemini" | "vertex-ai"
-  "timeout": 120000,                   // Request timeout in ms (default: 120000)
-  "maxRetries": 3,                     // Retry attempts (default: 3)
-  "enableCacheControl": true,          // Enable DashScope prompt caching
-  "contextWindowSize": 128000,         // Model context window size
-  "customHeaders": {},                 // Additional HTTP headers
-  "extra_body": {},                    // Extra fields merged into the request body
-  "schemaCompliance": "auto",          // "auto" | "openapi_30"
-  "samplingParams": {
-    "temperature": 0.7,
-    "top_p": 0.9,
-    "top_k": 40,
-    "max_tokens": 4096,
-    "presence_penalty": 0.0,
-    "frequency_penalty": 0.0,
-    "repetition_penalty": 1.0
-  }
+  "model": "coder-model",
+  "messages": [{ "role": "user", "content": "What's the weather in Beijing?" }],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get current weather for a location",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "location": { "type": "string", "description": "City name" }
+          },
+          "required": ["location"]
+        }
+      }
+    }
+  ],
+  "tool_choice": "auto"
 }
 ```
 
-### Default Models
+When the model decides to call a tool, the response includes `tool_calls` instead of `content`:
 
-| Auth Type    | Default Model         |
-| ------------ | --------------------- |
-| `openai`     | `qwen3-coder-plus`    |
-| `qwen-oauth` | `coder-model`        |
+```json
+{
+  "choices": [{
+    "message": {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+        {
+          "id": "call_abc123",
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "arguments": "{\"location\":\"Beijing\"}"
+          }
+        }
+      ]
+    },
+    "finish_reason": "tool_calls"
+  }]
+}
+```
 
-### Qwen OAuth Built-in Models
+The client executes the tool and sends the result back:
 
-| Model ID       | Description                                                        | Vision |
-| -------------- | ------------------------------------------------------------------ | ------ |
-| `coder-model`  | Qwen 3.5 Plus — efficient hybrid model with leading coding perf.  | No     |
-| `vision-model` | The latest Qwen Vision model from Alibaba Cloud ModelStudio        | Yes    |
+```json
+{
+  "messages": [
+    { "role": "user", "content": "What's the weather in Beijing?" },
+    {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [{ "id": "call_abc123", "type": "function", "function": { "name": "get_weather", "arguments": "{\"location\":\"Beijing\"}" } }]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_abc123",
+      "content": "{\"temperature\": 22, \"condition\": \"sunny\"}"
+    }
+  ]
+}
+```
 
----
+During streaming, tool call arguments arrive incrementally across multiple chunks. Qwen Code accumulates the fragments and reconstructs the full call when `finish_reason` is received.
 
-## Differences from Vanilla OpenAI
+**`tool_choice` options:**
 
-The API is **fully OpenAI-compatible** with these provider-specific extensions:
+- `"auto"` — model decides whether to call a tool
+- `"required"` — model must call at least one tool
+- `{"type": "function", "function": {"name": "..."}}` — force a specific tool
 
-| Feature | Standard OpenAI | Qwen Code Extensions |
-| ------- | --------------- | -------------------- |
-| Endpoint format | `/v1/chat/completions` | ✅ Same |
-| Request body | Standard fields | Adds `top_k`, `repetition_penalty`, `extra_body` |
-| Response body | Standard fields | ✅ Same (plus `cached_tokens` at usage level for DashScope) |
-| Streaming | SSE with `data:` lines | ✅ Same (DashScope may use `error_finish` instead of HTTP errors) |
-| Tool calling | OpenAI function calling format | ✅ Same |
-| Auth | `Authorization: Bearer` | ✅ Same (plus Qwen OAuth device flow as an alternative) |
-| Headers | Standard | DashScope adds `X-DashScope-*`; OpenRouter adds `HTTP-Referer`, `X-OpenRouter-Title` |
-| Vision/multipart | Content parts array | DeepSeek strips non-text parts; others support it |
+### Prompt Caching
 
-**Bottom line:** Any OpenAI-compatible server or client library will work with Qwen Code. The DashScope-specific headers and OAuth flow are only used when connecting to Alibaba Cloud's DashScope service.
+DashScope supports **prompt caching** to speed up repeated requests with shared context (like system prompts). This is enabled by default for qwen-oauth.
+
+**How it works:**
+
+- The `X-DashScope-CacheControl: enable` header activates caching.
+- The DashScope provider automatically marks messages with `cache_control: { type: "ephemeral" }` to indicate which parts should be cached:
+  - **System message** — always cached.
+  - **Last tool definition** — cached during streaming.
+  - **Most recent history message** — cached during streaming.
+- Cached tokens are reported in the response under `usage.prompt_tokens_details.cached_tokens`.
+
+Caching is automatic and transparent — no user configuration needed.
