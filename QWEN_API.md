@@ -5,7 +5,7 @@ The **default API protocol is OpenAI-compatible** when `authType` is `openai`.
 
 ## How provider selection works
 
-- `AuthType` is defined in `/home/runner/work/qwen-code/qwen-code/packages/core/src/core/contentGenerator.ts`:
+- `AuthType` is defined in `packages/core/src/core/contentGenerator.ts`:
   - `openai`
   - `qwen-oauth`
   - `gemini`
@@ -21,8 +21,8 @@ The **default API protocol is OpenAI-compatible** when `authType` is `openai`.
 
 OpenAI-compatible routing lives in:
 
-- `/home/runner/work/qwen-code/qwen-code/packages/core/src/core/openaiContentGenerator/index.ts`
-- `/home/runner/work/qwen-code/qwen-code/packages/core/src/core/openaiContentGenerator/provider/default.ts`
+- `packages/core/src/core/openaiContentGenerator/index.ts`
+- `packages/core/src/core/openaiContentGenerator/provider/default.ts`
 
 It uses the OpenAI SDK client with:
 
@@ -32,7 +32,7 @@ It uses the OpenAI SDK client with:
 
 Default/recognized OpenAI-compatible endpoints are in:
 
-- `/home/runner/work/qwen-code/qwen-code/packages/core/src/core/openaiContentGenerator/constants.ts`
+- `packages/core/src/core/openaiContentGenerator/constants.ts`
   - `https://api.openai.com/v1`
   - `https://dashscope.aliyuncs.com/compatible-mode/v1`
   - `https://api.deepseek.com/v1`
@@ -51,13 +51,13 @@ Provider specializations are still OpenAI-compatible (same core protocol) with s
 
 Qwen OAuth token acquisition is **not OpenAI API format**. It uses OAuth device-code endpoints:
 
-- `/home/runner/work/qwen-code/qwen-code/packages/core/src/qwen/qwenOAuth2.ts`
+- `packages/core/src/qwen/qwenOAuth2.ts`
   - `https://chat.qwen.ai/api/v1/oauth2/device/code`
   - `https://chat.qwen.ai/api/v1/oauth2/token`
 
 After obtaining/refreshing tokens, generation requests are sent through an OpenAI-compatible DashScope provider in:
 
-- `/home/runner/work/qwen-code/qwen-code/packages/core/src/qwen/qwenContentGenerator.ts`
+- `packages/core/src/qwen/qwenContentGenerator.ts`
 
 So `qwen-oauth` = **OAuth login flow + OpenAI-compatible inference calls**.
 
@@ -65,13 +65,13 @@ So `qwen-oauth` = **OAuth login flow + OpenAI-compatible inference calls**.
 
 Not OpenAI-compatible protocol. Uses Google GenAI SDK:
 
-- `/home/runner/work/qwen-code/qwen-code/packages/core/src/core/geminiContentGenerator/geminiContentGenerator.ts`
+- `packages/core/src/core/geminiContentGenerator/geminiContentGenerator.ts`
 
 ### 3) Anthropic
 
 Not OpenAI-compatible protocol. Uses Anthropic SDK:
 
-- `/home/runner/work/qwen-code/qwen-code/packages/core/src/core/anthropicContentGenerator/anthropicContentGenerator.ts`
+- `packages/core/src/core/anthropicContentGenerator/anthropicContentGenerator.ts`
 
 ## Bottom line
 
