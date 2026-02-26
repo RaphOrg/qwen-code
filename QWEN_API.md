@@ -1,80 +1,152 @@
-# Qwen Code API Surface
+# QWEN OAuth API Flow (`authType: "qwen-oauth"`)
 
-This repository supports multiple model backends.  
-The **default API protocol is OpenAI-compatible** when `authType` is `openai`.
+This document describes only the `qwen-oauth` path in this codebase.
 
-## How provider selection works
+## 1) How auth works
 
-- `AuthType` is defined in `packages/core/src/core/contentGenerator.ts`:
-  - `openai`
-  - `qwen-oauth`
-  - `gemini`
-  - `vertex-ai`
-  - `anthropic`
-- Runtime routing happens in `createContentGenerator(...)` in the same file:
-  - `openai` -> OpenAI-compatible generator
-  - `qwen-oauth` -> Qwen OAuth flow + Qwen content generator
-  - `gemini` / `vertex-ai` -> Gemini generator
-  - `anthropic` -> Anthropic generator
+Main entry point:
 
-## OpenAI-compatible path (yes, this is the main/default style)
+- `packages/core/src/qwen/qwenOAuth2.ts` -> `getQwenOAuthClient(...)`
 
-OpenAI-compatible routing lives in:
+High-level behavior:
 
-- `packages/core/src/core/openaiContentGenerator/index.ts`
-- `packages/core/src/core/openaiContentGenerator/provider/default.ts`
+1. Try to load/reuse valid cached credentials via `SharedTokenManager.getValidCredentials(...)`.
+2. If valid token exists, use it immediately.
+3. If not, run OAuth device flow (`authWithQwenDeviceFlow(...)`).
+4. Cache credentials to `~/.qwen/oauth_creds.json`.
 
-It uses the OpenAI SDK client with:
+Token cache + refresh coordination:
 
-- `apiKey`
-- `baseURL` (from config)
-- standard chat-completions style request building
+- `packages/core/src/qwen/sharedTokenManager.ts`
+- Handles cross-process locking and refresh to avoid token races.
 
-Default/recognized OpenAI-compatible endpoints are in:
+OAuth endpoints:
 
-- `packages/core/src/core/openaiContentGenerator/constants.ts`
-  - `https://api.openai.com/v1`
-  - `https://dashscope.aliyuncs.com/compatible-mode/v1`
-  - `https://api.deepseek.com/v1`
-  - `https://openrouter.ai/api/v1`
+- Device code: `https://chat.qwen.ai/api/v1/oauth2/device/code`
+- Token (poll + refresh): `https://chat.qwen.ai/api/v1/oauth2/token`
 
-Provider specializations are still OpenAI-compatible (same core protocol) with small header/request tweaks:
+## 2) How device code is generated
 
-- DashScope: `/provider/dashscope.ts`
-- DeepSeek: `/provider/deepseek.ts`
-- OpenRouter: `/provider/openrouter.ts`
-- ModelScope: `/provider/modelscope.ts`
+In `authWithQwenDeviceFlow(...)`:
 
-## What is **not** purely OpenAI-compatible
+1. Local PKCE values are generated:
+   - `generateCodeVerifier()` -> random verifier
+   - `generateCodeChallenge(verifier)` -> SHA-256 challenge
+2. Client requests device authorization with:
+   - `client_id`
+   - `scope` (`openid profile email model.completion`)
+   - `code_challenge`
+   - `code_challenge_method: S256`
+3. Server returns device auth payload (`DeviceAuthorizationData`) containing:
+   - `device_code`
+   - `user_code`
+   - `verification_uri`
+   - `verification_uri_complete`
+   - `expires_in`
 
-### 1) `qwen-oauth` authentication flow
+Important: `device_code` is issued by the OAuth server; the client generates PKCE verifier/challenge used in the same flow.
 
-Qwen OAuth token acquisition is **not OpenAI API format**. It uses OAuth device-code endpoints:
+## 3) How authorization is confirmed
 
-- `packages/core/src/qwen/qwenOAuth2.ts`
-  - `https://chat.qwen.ai/api/v1/oauth2/device/code`
-  - `https://chat.qwen.ai/api/v1/oauth2/token`
+After device auth response:
 
-After obtaining/refreshing tokens, generation requests are sent through an OpenAI-compatible DashScope provider in:
+1. Emits `QwenOAuth2Event.AuthUri` for UI integration.
+2. Opens browser to `verification_uri_complete` (unless suppressed), or prints fallback URL box.
+3. Polls token endpoint with:
+   - `grant_type = urn:ietf:params:oauth:grant-type:device_code`
+   - `device_code`
+   - `code_verifier`
+4. Poll responses handled as:
+   - `authorization_pending` -> keep polling
+   - `slow_down` -> increase poll interval
+   - success -> store tokens, emit success
+   - 401/429/timeout/cancel/error -> emit appropriate failure status
 
-- `packages/core/src/qwen/qwenContentGenerator.ts`
+## 4) How a message is sent to the API
 
-So `qwen-oauth` = **OAuth login flow + OpenAI-compatible inference calls**.
+Routing:
 
-### 2) Gemini / Vertex AI
+- `packages/core/src/core/contentGenerator.ts`
+  - `AuthType.QWEN_OAUTH` creates `QwenContentGenerator`.
 
-Not OpenAI-compatible protocol. Uses Google GenAI SDK:
+Message send path:
 
-- `packages/core/src/core/geminiContentGenerator/geminiContentGenerator.ts`
+1. `QwenContentGenerator.generateContent(...)` or `.generateContentStream(...)`
+2. `executeWithCredentialManagement(...)` gets valid token + endpoint (from shared credentials).
+3. It sets dynamic client auth:
+   - `pipeline.client.apiKey = access_token`
+   - `pipeline.client.baseURL = normalized(resource_url or default DashScope URL)`
+4. Delegates to OpenAI-compatible pipeline:
+   - `packages/core/src/core/openaiContentGenerator/pipeline.ts`
+   - calls `client.chat.completions.create(...)` (non-stream or stream)
 
-### 3) Anthropic
+So inference calls are OpenAI-compatible chat-completions over DashScope-style endpoint, authenticated with OAuth access token.
 
-Not OpenAI-compatible protocol. Uses Anthropic SDK:
+## 5) How message is received
 
-- `packages/core/src/core/anthropicContentGenerator/anthropicContentGenerator.ts`
+Response path:
 
-## Bottom line
+1. OpenAI-compatible response/chunks come back from `chat.completions.create(...)`.
+2. Converted by `OpenAIContentConverter`:
+   - `packages/core/src/core/openaiContentGenerator/converter.ts`
+   - `convertOpenAIResponseToGemini(...)`
+   - `convertOpenAIChunkToGemini(...)`
+3. Returned to upper layers as `GenerateContentResponse` (Gemini-style internal format).
 
-- If configured with `authType: "openai"` (or DashScope/DeepSeek/OpenRouter/ModelScope OpenAI-style base URLs), this codebase is OpenAI-compatible.
-- If configured with `qwen-oauth`, only the login/token flow is custom OAuth; model calls still go through an OpenAI-compatible provider.
-- `gemini`/`vertex-ai` and `anthropic` are provider-native, not OpenAI-compatible.
+## 6) What is received
+
+### OAuth token response (auth stage)
+
+On success, token payload includes fields such as:
+
+- `access_token`
+- `refresh_token` (if provided)
+- `token_type`
+- `expires_in`
+- `resource_url` (used to build API base URL dynamically)
+
+### Model generation response (inference stage)
+
+Converted `GenerateContentResponse` includes:
+
+- `candidates[].content.parts[]` (text, thought, functionCall/tool-call parts)
+- `finishReason`
+- `usageMetadata` (token counts, cached tokens, thinking tokens when available)
+- `responseId`, `modelVersion`, `createTime`
+
+## 7) What models it can use
+
+Hard-coded Qwen OAuth models are in:
+
+- `packages/core/src/models/constants.ts` (`QWEN_OAUTH_MODELS`)
+
+Allowed model IDs:
+
+- `coder-model` (default)
+- `vision-model`
+
+These are always registered for `qwen-oauth` and are not overridden by user modelProviders config:
+
+- `packages/core/src/models/modelRegistry.ts`
+
+## 8) What features it has (vision, web search, tools)
+
+### Vision
+
+- `vision-model` has `capabilities: { vision: true }`.
+- DashScope provider has vision handling and enables `vl_high_resolution_images: true` for vision models:
+  - `packages/core/src/core/openaiContentGenerator/provider/dashscope.ts`
+
+### Web search
+
+- Tool name exists as `web_search`:
+  - `packages/core/src/tools/tool-names.ts`
+- Tool is conditionally registered when web search config exists:
+  - `packages/core/src/config/config.ts` (`getWebSearchConfig()` check)
+- DashScope web-search provider is available for `qwen-oauth` and uses OAuth credentials (`resource_url` + bearer token):
+  - `packages/core/src/tools/web-search/providers/dashscope-provider.ts`
+
+### Tool/function calling
+
+- OpenAI-compatible tool calls are supported in request/response conversion:
+  - `packages/core/src/core/openaiContentGenerator/converter.ts`
